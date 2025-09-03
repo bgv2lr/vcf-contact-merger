@@ -1,0 +1,23 @@
+{
+  "input_files": {
+    "source": "contacts_private_v13.vcf",
+    "update": "icloud.vcf"
+  },
+  "output_file": "contacts_merged.vcf",
+  "backup_enabled": true,
+  "backup_suffix": "_backup",
+  "log_level": "DEBUG",
+  "split_output": true,
+  "split_output_dir": "contacts_split",
+  "vcf_version": "3.0",
+  "phone_validation": {
+    "min_digits": 7,
+    "check_duplicates": true,
+    "allow_international": true
+  },
+      "conflict_resolution": {
+        "auto_resolve": true,
+        "prefer_update_for": ["TEL", "ADR", "ORG", "NOTE"],
+        "prefer_source_for": ["N", "FN", "BDAY", "EMAIL"]
+    }
+}

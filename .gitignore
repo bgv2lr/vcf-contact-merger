@@ -1,0 +1,11 @@
+pycache/
+*.pyc
+*.pyo
+*.log
+_backup
+contacts_split/
+.vcf
+!sample/.vcf
+.DS_Store
+Thumbs.db
+.env
