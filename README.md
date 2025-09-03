@@ -1,127 +1,83 @@
-# VCF Contact Merger
+VCF Contact Merger
 
-Advanced VCF Contact Merger with automatic conflict resolution, duplicate removal, and comprehensive phone number parsing. Supports iCloud and Outlook formats.
+Python tool to read, merge and normalize contacts from vCard (.vcf) files so they import cleanly into Outlook and iCloud.
 
-## Features
+Features
+- Email, phone, and address parsing
+  - Supports standard `EMAIL:` and `TEL:` lines and iCloud `itemX.*` variants
+  - Preserves `TYPE` parameters (e.g., `TEL;TYPE=CELL;TYPE=VOICE:`) for correct Outlook/iCloud mapping
+  - De-duplicates while keeping order; mobile numbers are prioritized when ordering
+- Birthday normalization
+  - Converts many formats to `YYYY-MM-DD`; uses `1900` when year is missing (e.g., `07.12` → `1900-12-07`)
+- NOTE extraction and cleanup
+  - Promotes phones/emails/addresses/title from NOTE lines into proper fields
+  - Removes redundant NOTE lines and combines remaining notes into a single NOTE with embedded newlines so Outlook/iCloud display everything
+- Duplicate handling
+  - Merges duplicate contacts by normalized name, preserving the richer data
+- Optional per-contact export
+  - Writes one `.vcf` per contact (helpful for Outlook which often imports only the first card in a multi-card file)
 
-- **Automatic Conflict Resolution**: Intelligently resolves conflicts between source and update data
-- **Duplicate Removal**: Removes duplicate contacts, keeping the most complete entry
-- **Comprehensive Phone Number Parsing**: Handles various VCF formats including iCloud and Outlook
-- **Phone Number Validation**: Ensures only valid phone numbers are included
-- **Email Extraction**: Extracts emails from various VCF formats
-- **Address Consolidation**: Merges address information from multiple sources
-- **Backup System**: Automatic backup before processing
-- **Logging**: Comprehensive logging for debugging and monitoring
+Requirements
+- Python 3.8+ (no external dependencies)
 
-## Installation
+Configuration
+Edit `vcf_config.json` in the project directory. Example:
 
-1. Clone the repository:
-```bash
-git clone https://github.com/bgv2lr/vcf-contact-merger.git
-cd vcf-contact-merger
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-## Configuration
-
-Edit `vcf_config.json` to configure input/output files and advanced options:
-
-```json
 {
-    "input_files": {
-        "source": "source_contacts.vcf",
-        "update": "update_contacts.vcf"
-    },
-    "output_file": "merged_contacts.vcf",
-    "backup_enabled": true,
-    "log_level": "INFO",
-    "phone_validation": {
-        "min_digits": 7,
-        "check_duplicates": true,
-        "allow_international": true
-    },
-    "conflict_resolution": {
-        "auto_resolve": true,
-        "prefer_update_for": ["EMAIL", "TEL", "ADR", "ORG", "NOTE"],
-        "prefer_source_for": ["N", "FN", "BDAY"]
-    }
+  "input_files": {
+    "source": "contacts_private_v13.vcf",
+    "update": "icloud.vcf"
+  },
+  "output_file": "contacts_merged.vcf",
+  "backup_enabled": true,
+  "backup_suffix": "_backup",
+  "log_level": "DEBUG",
+  "split_output": true,
+  "split_output_dir": "contacts_split",
+  "vcf_version": "3.0",
+  "phone_validation": {
+    "min_digits": 7,
+    "check_duplicates": true,
+    "allow_international": true
+  },
+  "conflict_resolution": {
+    "auto_resolve": true,
+    "prefer_update_for": ["TEL", "ADR", "ORG", "NOTE"],
+    "prefer_source_for": ["N", "FN", "BDAY", "EMAIL"]
+  }
 }
-```
 
-## Usage
+Notes:
+- Set `split_output` to `true` to also generate one `.vcf` per contact in `contacts_split/`.
+- `vcf_version` can be set to `"2.1"` if a client is picky; `3.0` works well for iCloud and most Outlook versions.
+- The code no longer enforces max limits for phones/emails; all unique entries are written.
 
-### Basic Usage
-```bash
-python update_private_vcf.py
-```
+Usage
+- Windows (PowerShell or Git Bash):
+  - `python vcf_merger.py`
+- The script will:
+  - Read `source` and, if provided, `update`
+  - Merge contacts with conflict resolution and NOTE promotion/cleanup
+  - Write the combined VCF to `output_file`
+  - If `split_output` is true, also write one `.vcf` per contact under `split_output_dir`
 
-### Advanced Usage
-```python
-from update_private_vcf import VCFMerger
+Outlook/iCloud Tips
+- Outlook often imports only the first contact from a multi-card VCF. Use `split_output: true` and drag all generated `.vcf` files into Outlook’s Contacts folder.
+- TYPE parameters (`WORK`, `HOME`, `CELL`) are preserved for phone numbers so Outlook/iCloud put them in the right fields.
+- Remaining notes are combined into a single NOTE property with line breaks for reliable display.
 
-merger = VCFMerger('config.json')
-output_file = merger.update_vcf_with_vcf(remove_duplicates_flag=True)
-print(f"Created: {output_file}")
-```
+Suggested .gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*_backup*
+contacts_split/
+*.vcf
+!sample/*.vcf
+.DS_Store
+Thumbs.db
+.env
 
-## Conflict Resolution Rules
-
-- **BDAY**: Prefers source unless update has default date (1900-01-01)
-- **NOTE**: Prefers update (more structured information)
-- **EMAIL**: Prefers update (more current)
-- **TEL**: Prefers update (more current)
-- **ADR**: Prefers update (more complete)
-- **ORG**: Prefers update (more current)
-- **N/FN**: Prefers source (better formatted)
-
-## Phone Number Validation
-
-- **Configurable minimum digits** (default: 7)
-- **Duplicate detection** (configurable)
-- **International format support**
-- **iCloud and Outlook specific formats**
-- **Advanced regex patterns** for complex formats
-- **Comprehensive validation** with detailed logging
-
-## File Structure
-
-```
-vcf-contact-merger/
-├── update_private_vcf.py      # Main script
-├── update_private_vcf_fixed.py # Fixed version
-├── test_vcf_merger.py         # Unit tests
-├── vcf_config.json           # Configuration
-├── requirements.txt          # Dependencies
-└── README.md                # This file
-```
-
-## Testing
-
-Run the test suite:
-```bash
-python test_vcf_merger.py
-```
-
-## Logging
-
-Logs are written to `vcf_merger.log` with detailed information about:
-- File processing progress
-- Conflict resolutions
-- Phone number validations
-- Duplicate removals
-
-## Privacy
-
-This repository contains only source code. Sensitive contact data files are excluded via `.gitignore`.
-
-## License
-
-Private repository - All rights reserved.
-
-## Support
-
-For issues and questions, please contact the repository owner.
+License
+This project is provided as-is without warranty. Add a license here if you intend to publish under a specific license.
