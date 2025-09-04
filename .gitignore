@@ -9,3 +9,5 @@ contacts_split/
 .DS_Store
 Thumbs.db
 .env
+.vscode/
+desktop.ini
