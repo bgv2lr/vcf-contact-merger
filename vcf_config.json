@@ -7,9 +7,24 @@
   "backup_enabled": true,
   "backup_suffix": "_backup",
   "log_level": "DEBUG",
-  "split_output": true,
+  "split_output": false,
   "split_output_dir": "contacts_split",
   "vcf_version": "3.0",
+  "validate_after_write": true,
+  "audit_after_merge": true,
+  "trace_contacts": [],
+  "validation_flags": {
+    "include_missing_email": false,
+    "include_missing_tel": false,
+    "include_missing_adr": false,
+    "include_mojibake": false,
+    "include_tel_anomalies": false
+  },
+  "text_replacements": {
+    "Rechtsanwï¿½ltin": "Rechtsanwältin",
+    "fï¿½r": "für",
+    "Mï¿½hsamstr.": "Mühsamstr."
+  },
   "phone_validation": {
     "min_digits": 7,
     "check_duplicates": true,

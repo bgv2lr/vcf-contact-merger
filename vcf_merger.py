@@ -3,6 +3,12 @@ import re
 import json
 import logging
 import shutil
+import quopri
+try:
+    import ftfy  # optional; used to further fix mojibake
+except Exception:
+    ftfy = None
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -110,15 +116,115 @@ class VCFParser:
     def __init__(self, config: VCFConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
+
+    def _decode_value(self, key_with_params: str, value: str) -> str:
+        """Decode value based on vCard params (ENCODING=QUOTED-PRINTABLE, CHARSET)."""
+        try:
+            parts = key_with_params.split(';')
+            params = {}
+            for p in parts[1:]:
+                if '=' in p:
+                    k, v = p.split('=', 1)
+                    params[k.strip().upper()] = v.strip()
+                else:
+                    params[p.strip().upper()] = True
+
+            encoding = params.get('ENCODING', '').upper()
+            charset = params.get('CHARSET')
+            if encoding in ('QUOTED-PRINTABLE', 'QP'):
+                raw = quopri.decodestring(value)
+                if charset:
+                    try:
+                        return raw.decode(charset, errors='replace')
+                    except Exception:
+                        return raw.decode('utf-8', errors='replace')
+                return raw.decode('utf-8', errors='replace')
+            return value
+        except Exception as e:
+            self.logger.debug(f"Decode failed for {key_with_params}: {e}")
+            return value
+
+    def _fix_text(self, text: str) -> str:
+        """Attempt to repair common mojibake for German umlauts and CP1252 punctuation.
+
+        - Fixes sequences like 'Ã¤' -> 'ä', 'Ã–' -> 'Ö', 'ÃŸ' -> 'ß', and removes stray 'Â'.
+        - If markers of mojibake are present (Ã, Â, â), try cp1252/latin1 round-trip.
+        - Heuristic for the frequent 'Straï¿½e' -> 'Straße'.
+        """
+        if not text:
+            return text
+
+        original = text
+
+        # Quick targeted replacements first
+        replacements = {
+            'Ã„': 'Ä', 'Ã¤': 'ä',
+            'Ã–': 'Ö', 'Ã¶': 'ö',
+            'Ãœ': 'Ü', 'Ã¼': 'ü',
+            'ÃŸ': 'ß',
+            'Â ': ' ', 'Â': '',
+            'â€“': '–', 'â€”': '—',
+            'â€œ': '“', 'â€': '”',
+            'â€˜': '‘', 'â€™': '’',
+            'â‚¬': '€',
+        }
+        for k, v in replacements.items():
+            if k in text:
+                text = text.replace(k, v)
+
+        # Heuristic: the infamous 'Straï¿½e' -> 'Straße'
+        if 'ï¿½' in text:
+            text = re.sub(r'(?i)straï¿½e', 'straße', text)
+
+        # If mojibake markers remain, try latin-1 -> utf-8 repair
+        if any(m in text for m in ('Ã', 'Â', 'â')):
+            try:
+                repaired = text.encode('latin-1', errors='strict').decode('utf-8', errors='strict')
+                # Prefer repaired if it introduces expected umlauts or removes markers
+                if ('Ã' in text or 'Â' in text or 'â' in text) and not any(m in repaired for m in ('Ã', 'Â')):
+                    text = repaired
+            except Exception:
+                pass
+
+        # Apply user-defined replacements from config (allows precise fixes like Rechtsanwï¿½ltin -> Rechtsanwältin)
+        try:
+            custom = self.config.get('text_replacements', {}) or {}
+            if isinstance(custom, dict):
+                for k, v in custom.items():
+                    if k and isinstance(k, str) and v is not None:
+                        text = text.replace(k, str(v))
+        except Exception:
+            pass
+
+        # Optional: use ftfy if available for broader Unicode fixes
+        if ftfy is not None:
+            try:
+                fixed = ftfy.fix_text(text)
+                # Prefer ftfy result if it reduces common mojibake markers
+                markers = ('Ã', 'Â', 'â', 'ï¿½', '\ufffd')
+                def score(s: str) -> int:
+                    return sum(s.count(m) for m in markers)
+                if score(fixed) <= score(text):
+                    text = fixed
+            except Exception:
+                pass
+
+        # Return repaired if meaningfully different
+        return text
     
     def parse_name_field(self, line: str, current_contact: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
         """Parse name fields (N, FN)."""
         try:
-            if line.startswith('N:'):
-                current_contact['N'] = line
+            if line.startswith('N:') or line.startswith('N;'):
+                key, value = line.split(':', 1)
+                decoded = self._decode_value(key, value)
+                fixed = self._fix_text(decoded)
+                current_contact['N'] = f"N:{fixed}"
                 return current_contact, None
-            elif line.startswith('FN:'):
-                name = line.split(':', 1)[-1].strip()
+            elif line.startswith('FN:') or line.startswith('FN;'):
+                key, value = line.split(':', 1)
+                decoded = self._decode_value(key, value)
+                name = self._fix_text(decoded.strip())
                 current_contact['FN'] = name
                 return current_contact, name
         except Exception as e:
@@ -202,6 +308,11 @@ class VCFParser:
             self.logger.debug(f"Phone number too short: {phone} (only {len(digits_only)} digits, need {min_digits})")
             return False
         
+        # Reject date-like strings (e.g., 28.09.2016 or 2016-09-28)
+        if re.match(r"^(?:\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?|\d{4}[./-]\d{1,2}[./-]\d{1,2})$", phone.strip()):
+            self.logger.debug(f"Rejected date-like as phone: {phone}")
+            return False
+
         # Must not be empty or just zeros
         if not phone or phone == '0' or phone == '':
             return False
@@ -309,13 +420,21 @@ class VCFParser:
         if 'EMAIL' not in current_contact or not isinstance(current_contact['EMAIL'], list):
             current_contact['EMAIL'] = []
         
-        email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', value)
+        # Decode value using vCard params if present (handles quoted-printable + charset)
+        try:
+            key_with_params = line.split(':', 1)[0]
+        except Exception:
+            key_with_params = 'EMAIL'
+        decoded_value = self._decode_value(key_with_params, value)
+        decoded_value = self._fix_text(decoded_value)
+        
+        email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', decoded_value)
         if email_match:
             # Store emails in standard form for vCard writing
             current_contact['EMAIL'].append(f"EMAIL:{email_match.group(1)}")
             self.logger.debug(f"Found email: {line} -> Extracted: EMAIL:{email_match.group(1)} for {current_name}")
         else:
-            normalized_value = value.rstrip(';').strip()
+            normalized_value = decoded_value.rstrip(';').strip()
             current_contact['EMAIL'].append(f"EMAIL:{normalized_value}")
             self.logger.debug(f"Found email: {line} -> No valid email found, using: EMAIL:{normalized_value} for {current_name}")
     
@@ -405,7 +524,10 @@ class VCFParser:
         for note in current_contact['NOTE']:
             # Prefer text after a known phone label if present
             label = None
-            for lbl in ['Business Phone:', 'Home Phone:', 'Mobile Phone:', 'Other Phone:', 'Phone:']:
+            for lbl in [
+                'Business Phone:', 'Home Phone:', 'Mobile Phone:', 'Other Phone:', 'Phone:',
+                'Main Phone:', 'Telefon:', 'Haupttelefon:', 'Privat Telefon:', 'Geschäftlich Telefon:'
+            ]:
                 if lbl in note:
                     label = lbl
                     break
@@ -413,7 +535,13 @@ class VCFParser:
                 labeled_part = note.split(':', 1)[-1]
                 candidates = phone_pattern.findall(labeled_part)
             else:
-                candidates = phone_pattern.findall(note)
+                # Only scan generically if the note looks phone-related
+                lower = note.lower()
+                phone_keywords = ['phone', 'telefon', 'tel', 'fax', 'mobile', 'handy', 'cell', 'geschäftlich', 'geschaeftlich', 'privat', 'home', 'work']
+                if any(kw in lower for kw in phone_keywords):
+                    candidates = phone_pattern.findall(note)
+                else:
+                    candidates = []
 
             added_from_this_note = False
             for cand in candidates:
@@ -451,6 +579,113 @@ class VCFParser:
         else:
             self.logger.debug(f"No phone numbers extracted from NOTES for {current_name}")
 
+    def extract_address_from_notes(self, current_contact: Dict[str, Any], current_name: Optional[str]) -> None:
+        """
+        Extract a WORK address from NOTE lines with labels like:
+        - Business Street:
+        - Business City:
+        - Business State: (optional)
+        - Business Postal Code:
+        - Business Country/Region:
+
+        Builds an ADR;TYPE=WORK;TYPE=pref entry: ADR;TYPE=WORK;TYPE=pref:;;street;city;region;postal;country
+        Skips if an identical ADR already exists.
+        """
+        notes = current_contact.get('NOTE')
+        if not isinstance(notes, list) or not notes:
+            return
+
+        # Collect components
+        comp = {'street': '', 'city': '', 'region': '', 'postal': '', 'country': ''}
+        for note in notes:
+            raw_after_note = note.split(':', 1)[-1] if ':' in note else note
+            lower = raw_after_note.lower()
+            def strip_label(s: str, label: str) -> str:
+                return re.sub(rf"(?i)^\s*{re.escape(label)}\s*:\s*", '', s).strip()
+            if 'business street:' in lower:
+                val = strip_label(raw_after_note, 'Business Street')
+                comp['street'] = self._fix_text(val)
+            elif 'business city:' in lower:
+                val = strip_label(raw_after_note, 'Business City')
+                comp['city'] = self._fix_text(val)
+            elif 'business state:' in lower:
+                val = strip_label(raw_after_note, 'Business State')
+                comp['region'] = self._fix_text(val)
+            elif 'business postal code:' in lower:
+                val = strip_label(raw_after_note, 'Business Postal Code')
+                comp['postal'] = self._fix_text(val)
+            elif 'business country/region:' in lower or 'business country:' in lower:
+                # Support both label variants
+                val = strip_label(raw_after_note, 'Business Country/Region')
+                if val == raw_after_note:
+                    val = strip_label(raw_after_note, 'Business Country')
+                comp['country'] = self._fix_text(val)
+
+        # Require at least street + city to add
+        have_min = bool(comp['street'] and comp['city'])
+        if not have_min:
+            self.logger.debug(f"No sufficient NOTE address components for {current_name}")
+            return
+
+        adr_value = f"ADR;TYPE=WORK;TYPE=pref:;;{comp['street']};{comp['city']};{comp['region']};{comp['postal']};{comp['country']}"
+        # Ensure ADR list exists
+        if 'ADR' not in current_contact or not isinstance(current_contact['ADR'], list):
+            current_contact['ADR'] = []
+        # Check for duplicates by payload
+        payload = adr_value.split(':', 1)[-1].strip().lower()
+        existing_payloads = set()
+        for adr in current_contact['ADR']:
+            if ':' in adr:
+                existing_payloads.add(adr.split(':', 1)[-1].strip().lower())
+        if payload in existing_payloads:
+            self.logger.debug(f"NOTE-derived address already exists for {current_name}")
+            return
+
+        current_contact['ADR'].append(adr_value)
+        self.logger.info(f"Extracted WORK address from NOTES for {current_name}: {adr_value}")
+
+    def extract_home_address_from_notes(self, current_contact: Dict[str, Any], current_name: Optional[str]) -> None:
+        """Extract a HOME address from NOTE lines with Home Street/City/State/Postal/Country labels."""
+        notes = current_contact.get('NOTE')
+        if not isinstance(notes, list) or not notes:
+            return
+
+        comp = {'street': '', 'city': '', 'region': '', 'postal': '', 'country': ''}
+        for note in notes:
+            raw_after_note = note.split(':', 1)[-1] if ':' in note else note
+            lower = raw_after_note.lower()
+            def strip_label(s: str, label: str) -> str:
+                return re.sub(rf"(?i)^\s*{re.escape(label)}\s*:\s*", '', s).strip()
+            if 'home street:' in lower:
+                comp['street'] = self._fix_text(strip_label(raw_after_note, 'Home Street'))
+            elif 'home city:' in lower:
+                comp['city'] = self._fix_text(strip_label(raw_after_note, 'Home City'))
+            elif 'home state:' in lower:
+                comp['region'] = self._fix_text(strip_label(raw_after_note, 'Home State'))
+            elif 'home postal code:' in lower:
+                comp['postal'] = self._fix_text(strip_label(raw_after_note, 'Home Postal Code'))
+            elif 'home country/region:' in lower or 'home country:' in lower:
+                val = strip_label(raw_after_note, 'Home Country/Region')
+                if val == raw_after_note:
+                    val = strip_label(raw_after_note, 'Home Country')
+                comp['country'] = self._fix_text(val)
+
+        if not (comp['street'] and comp['city']):
+            return
+
+        adr_value = f"ADR;TYPE=HOME;TYPE=pref:;;{comp['street']};{comp['city']};{comp['region']};{comp['postal']};{comp['country']}"
+        if 'ADR' not in current_contact or not isinstance(current_contact['ADR'], list):
+            current_contact['ADR'] = []
+        payload = adr_value.split(':', 1)[-1].strip().lower()
+        existing_payloads = set()
+        for adr in current_contact['ADR']:
+            if ':' in adr:
+                existing_payloads.add(adr.split(':', 1)[-1].strip().lower())
+        if payload in existing_payloads:
+            return
+        current_contact['ADR'].append(adr_value)
+        self.logger.info(f"Extracted HOME address from NOTES for {current_name}: {adr_value}")
+
     def cleanup_notes(self, current_contact: Dict[str, Any], current_name: Optional[str]) -> None:
         """Remove NOTE lines that duplicate data already promoted to structured fields.
 
@@ -479,7 +714,10 @@ class VCFParser:
             ]
         if has_adr:
             drop_prefixes += [
-                'NOTE:Business Street:', 'NOTE:Business City:', 'NOTE:Business Postal Code:', 'NOTE:Business Country/Region:'
+                'NOTE:Business Street:', 'NOTE:Business City:', 'NOTE:Business Postal Code:', 'NOTE:Business Country/Region:',
+                'NOTE:Business State:',
+                'NOTE:Home Street:', 'NOTE:Home City:', 'NOTE:Home Postal Code:', 'NOTE:Home Country/Region:',
+                'NOTE:Home State:'
             ]
         if has_email:
             drop_prefixes += [
@@ -530,6 +768,10 @@ class VCFParser:
                 self.extract_emails_from_notes(current_contact, current_name)
                 # Also extract phone numbers from NOTE fields
                 self.extract_phones_from_notes(current_contact, current_name)
+                # Extract address from NOTE fields
+                self.extract_address_from_notes(current_contact, current_name)
+                # Extract HOME address from NOTE fields
+                self.extract_home_address_from_notes(current_contact, current_name)
                 # Remove redundant NOTE lines
                 self.cleanup_notes(current_contact, current_name)
                 self.logger.debug(f"vCard for {current_name} completed, fields before processing: {current_contact}")
@@ -543,19 +785,25 @@ class VCFParser:
         # Parse other fields
         if ':' in line and not line.startswith('END:'):
             key, value = line.split(':', 1)
-            normalized_value = value.rstrip(';').strip()
+            normalized_value = value.rstrip(';')
+            normalized_value = self._decode_value(key, normalized_value)
+            normalized_value = normalized_value.strip()
+            normalized_value = self._fix_text(normalized_value)
             
             if key.startswith('BDAY'):
                 if 'BDAY' not in current_contact:
                     normalized_value = self.parse_birthday_field(normalized_value)
                     current_contact['BDAY'] = normalized_value
                     self.logger.debug(f"Read BDAY field: {normalized_value} for {current_name}")
-            elif key.startswith('TEL'):
+            elif re.search(r'^(?:item\d+\.)?TEL', key, re.IGNORECASE):
                 self.parse_phone_field(line, current_contact, current_name)
             elif re.search(r'^(?:item\d+\.)?EMAIL', key, re.IGNORECASE):
                 self.parse_email_field(line, value, current_contact, current_name)
             elif re.search(r'^(?:item\d+\.)?ADR', key, re.IGNORECASE):
-                self.parse_address_field(key, value, current_contact, current_name)
+                # Decode and fix each ADR component
+                decoded_val = self._decode_value(key, value)
+                fixed_value = ';'.join(self._fix_text(part) for part in decoded_val.split(';'))
+                self.parse_address_field(key, fixed_value, current_contact, current_name)
             elif key == 'TITLE':
                 # Store proper TITLE field instead of duplicating into NOTE
                 current_contact['TITLE'] = normalized_value
@@ -563,7 +811,9 @@ class VCFParser:
             elif key in ['NOTE', 'ORG']:
                 if key in current_contact and not isinstance(current_contact[key], list):
                     current_contact[key] = [current_contact[key]]
-                current_contact[key] = current_contact.get(key, []) + [line]
+                # Recompose the line with fixed text so umlauts are preserved
+                fixed_line = f"{key}:{normalized_value}"
+                current_contact[key] = current_contact.get(key, []) + [fixed_line]
             else:
                 current_contact[key] = normalized_value
                 if current_name:
@@ -587,9 +837,25 @@ class VCFProcessor:
         current_name = None
         line_count = 0
         
+        def unfold_file_lines(fh):
+            """Unfold folded vCard lines: lines starting with space/tab are continuations."""
+            prev = None
+            for raw in fh:
+                raw = raw.rstrip('\r\n')
+                if prev is None:
+                    prev = raw
+                    continue
+                if raw.startswith((' ', '\t')):
+                    prev += raw.lstrip()
+                else:
+                    yield prev
+                    prev = raw
+            if prev is not None:
+                yield prev
+        
         try:
             with open(vcf_file, 'r', encoding='utf-8') as f:
-                for line in f:
+                for line in unfold_file_lines(f):
                     line_count += 1
                     if line_count % 2000 == 0:
                         self.logger.info(f"Processed {line_count} lines...")
@@ -610,8 +876,19 @@ class VCFProcessor:
                         self.parser.extract_emails_from_notes(current_contact, current_name)
                         # Also extract phone numbers from NOTE fields
                         self.parser.extract_phones_from_notes(current_contact, current_name)
+                        # Extract address from NOTE fields
+                        self.parser.extract_address_from_notes(current_contact, current_name)
+                        # Extract HOME address from NOTE fields
+                        self.parser.extract_home_address_from_notes(current_contact, current_name)
                         # Remove redundant NOTE lines
                         self.parser.cleanup_notes(current_contact, current_name)
+                        # Optional trace logging
+                        trace = self.config.get('trace_contacts', []) or []
+                        try:
+                            if current_name in trace:
+                                self.logger.info(f"TRACE parsed {current_name}: TEL={current_contact.get('TEL', [])}, ADR={current_contact.get('ADR', [])}, EMAIL={current_contact.get('EMAIL', [])}")
+                        except Exception:
+                            pass
                         self.logger.debug(f"Contact completed for {current_name}, emails after extraction: {current_contact.get('EMAIL', [])}")
                         contacts[current_name] = current_contact.copy()
                         current_contact = {}
@@ -620,7 +897,7 @@ class VCFProcessor:
         except UnicodeDecodeError:
             # Try with Latin-1 encoding
             with open(vcf_file, 'r', encoding='latin-1') as f:
-                for line in f:
+                for line in unfold_file_lines(f):
                     line_count += 1
                     if line_count % 2000 == 0:
                         self.logger.info(f"Processed {line_count} lines...")
@@ -641,8 +918,19 @@ class VCFProcessor:
                         self.parser.extract_emails_from_notes(current_contact, current_name)
                         # Also extract phone numbers from NOTE fields
                         self.parser.extract_phones_from_notes(current_contact, current_name)
+                        # Extract address from NOTE fields
+                        self.parser.extract_address_from_notes(current_contact, current_name)
+                        # Extract HOME address from NOTE fields
+                        self.parser.extract_home_address_from_notes(current_contact, current_name)
                         # Remove redundant NOTE lines
                         self.parser.cleanup_notes(current_contact, current_name)
+                        # Optional trace logging
+                        trace = self.config.get('trace_contacts', []) or []
+                        try:
+                            if current_name in trace:
+                                self.logger.info(f"TRACE parsed {current_name}: TEL={current_contact.get('TEL', [])}, ADR={current_contact.get('ADR', [])}, EMAIL={current_contact.get('EMAIL', [])}")
+                        except Exception:
+                            pass
                         self.logger.debug(f"Contact completed for {current_name}, emails after extraction: {current_contact.get('EMAIL', [])}")
                         contacts[current_name] = current_contact.copy()
                         current_contact = {}
@@ -654,6 +942,137 @@ class VCFProcessor:
         self.logger.info(f"Read {len(contacts)} contacts from {vcf_file}")
         return contacts
 
+    def validate_vcf(self, vcf_file: str) -> Dict[str, Any]:
+        """Validate a VCF file for common issues and return a summary dict.
+
+        Checks:
+        - Mojibake markers in any line (Ã, Â, â, �)
+        - TEL values that look like dates
+        - TEL values containing letters
+        - EMAIL lines that are empty or lack '@'
+        - ADR lines containing mojibake markers
+        - ADR lines with missing components (expect 7 fields)
+        Also summarizes contacts missing TEL / EMAIL / ADR entirely.
+        """
+        # Read validation behavior flags from config
+        vf = self.config.get('validation_flags', {}) if hasattr(self, 'config') else {}
+        include_missing_email = bool(vf.get('include_missing_email', False))
+        include_missing_tel = bool(vf.get('include_missing_tel', True))
+        include_missing_adr = bool(vf.get('include_missing_adr', False))
+        include_mojibake = bool(vf.get('include_mojibake', True))
+        include_tel_anomalies = bool(vf.get('include_tel_anomalies', True))
+
+        summary = {
+            'file': vcf_file,
+            'contacts_with_issues': set(),
+            'counts': {
+                'mojibake_lines': 0,
+                'tel_date_like': 0,
+                'tel_has_letters': 0,
+                'email_empty': 0,
+                'email_invalid': 0,
+                'adr_mojibake': 0,
+                'adr_incomplete': 0,
+                'missing_tel': 0,
+                'missing_email': 0,
+                'missing_adr': 0,
+                'missing_tel_and_email': 0,
+            },
+            'examples': {
+                'mojibake_lines': [],
+                'tel_date_like': [],
+                'tel_has_letters': [],
+                'email_empty': [],
+                'email_invalid': [],
+                'adr_mojibake': [],
+                'adr_incomplete': [],
+            }
+        }
+
+        def add(cat: str, contact: str, line: str):
+            summary['counts'][cat] += 1
+            if len(summary['examples'][cat]) < 10:
+                summary['examples'][cat].append((contact, line))
+            # Add to contacts_with_issues based on configured severity flags
+            if contact:
+                if cat in ('mojibake_lines', 'adr_mojibake') and include_mojibake:
+                    summary['contacts_with_issues'].add(contact)
+                elif cat in ('tel_date_like', 'tel_has_letters') and include_tel_anomalies:
+                    summary['contacts_with_issues'].add(contact)
+                elif cat == 'email_empty' and include_missing_email:
+                    summary['contacts_with_issues'].add(contact)
+                elif cat == 'email_invalid' and include_missing_email:
+                    summary['contacts_with_issues'].add(contact)
+                elif cat == 'adr_incomplete' and include_missing_adr:
+                    summary['contacts_with_issues'].add(contact)
+
+        current_name = ''
+        saw_tel = False
+        saw_email = False
+        saw_adr = False
+        try:
+            with open(vcf_file, 'r', encoding='utf-8') as fh:
+                for raw in fh:
+                    line = raw.rstrip('\r\n')
+                    if line.startswith('FN:'):
+                        current_name = line.split(':', 1)[-1]
+                        # reset per-contact trackers when FN appears (new card may start before BEGIN if malformed)
+                        saw_tel = False
+                        saw_email = False
+                        saw_adr = False
+                    if line == 'BEGIN:VCARD':
+                        saw_tel = False
+                        saw_email = False
+                        saw_adr = False
+                    # Mojibake markers
+                    if any(m in line for m in ('Ã', 'Â', 'â', '�')):
+                        add('mojibake_lines', current_name, line)
+                    # TEL checks
+                    if line.upper().startswith('TEL') and ':' in line:
+                        val = line.split(':', 1)[-1]
+                        saw_tel = True
+                        # date-like
+                        if re.search(r"(?:\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b|\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b)", val):
+                            add('tel_date_like', current_name, line)
+                        # letters
+                        if re.search(r'[A-Za-z]', val):
+                            add('tel_has_letters', current_name, line)
+                    # EMAIL checks
+                    if line.upper().startswith('EMAIL') and ':' in line:
+                        val = line.split(':', 1)[-1].strip()
+                        saw_email = True
+                        if val == '':
+                            add('email_empty', current_name, line)
+                        elif '@' not in val:
+                            add('email_invalid', current_name, line)
+                    # ADR checks
+                    if line.upper().startswith('ADR') and ':' in line:
+                        saw_adr = True
+                        if any(m in line for m in ('Ã', 'Â', 'â', '�')):
+                            add('adr_mojibake', current_name, line)
+                        payload = line.split(':', 1)[-1]
+                        parts = payload.split(';')
+                        if len(parts) < 7:
+                            add('adr_incomplete', current_name, line)
+                    # End of card: summarize missing core fields
+                    if line == 'END:VCARD':
+                        if not saw_tel:
+                            summary['counts']['missing_tel'] += 1
+                        if not saw_email:
+                            summary['counts']['missing_email'] += 1
+                        if not saw_adr:
+                            summary['counts']['missing_adr'] += 1
+                        # Only flag contacts that have neither TEL nor EMAIL
+                        if (not saw_tel) and (not saw_email):
+                            summary['counts']['missing_tel_and_email'] += 1
+                            if current_name:
+                                summary['contacts_with_issues'].add(current_name)
+        except Exception as e:
+            self.logger.error(f"Validation failed on {vcf_file}: {e}")
+
+        summary['contacts_with_issues'] = sorted(summary['contacts_with_issues'])
+        return summary
+
     def _auto_resolve_conflict(self, field: str, source_value: Any, update_value: Any, source_normalized: Any, update_normalized: Any) -> str:
         """
         Automatically resolves conflicts based on field type and configuration.
@@ -663,6 +1082,18 @@ class VCFProcessor:
         prefer_update_for = self.config.get('conflict_resolution', {}).get('prefer_update_for', ['EMAIL', 'TEL', 'ADR', 'ORG', 'NOTE'])
         prefer_source_for = self.config.get('conflict_resolution', {}).get('prefer_source_for', ['N', 'FN', 'BDAY'])
         
+        # Prefer text that doesn't look mojibake
+        def is_mojibake(s: Any) -> bool:
+            if not isinstance(s, str):
+                return False
+            return any(m in s for m in ('Ã', 'Â', 'â', 'ï¿½', '\ufffd'))
+
+        if isinstance(source_value, str) and isinstance(update_value, str):
+            if is_mojibake(source_value) and not is_mojibake(update_value):
+                return 'update'
+            if is_mojibake(update_value) and not is_mojibake(source_value):
+                return 'source'
+
         # BDAY fields: Prefer source (usually more accurate, avoid 1900-01-01)
         if field == 'BDAY':
             if '1900-01-01' in str(update_normalized) or '1900-01-01' in str(update_value):
@@ -743,9 +1174,10 @@ class VCFProcessor:
         # are properly extracted and added to EMAIL fields
         # WARNING: DO NOT REMOVE THIS - it's essential for contacts like Angelika Grix!
         if 'NOTE' in merged and isinstance(merged['NOTE'], list):
-            self.logger.info(f"Extracting emails/phones from NOTES for merged contact: {merged.get('FN', 'Unknown')}")
+            self.logger.info(f"Extracting emails/phones/address from NOTES for merged contact: {merged.get('FN', 'Unknown')}")
             self.parser.extract_emails_from_notes(merged, merged.get('FN', 'Unknown'))
             self.parser.extract_phones_from_notes(merged, merged.get('FN', 'Unknown'))
+            self.parser.extract_address_from_notes(merged, merged.get('FN', 'Unknown'))
         else:
             self.logger.debug(f"No NOTE field found for email extraction in merged contact: {merged.get('FN', 'Unknown')}")
         
@@ -845,8 +1277,52 @@ class VCFProcessor:
                             lines.append(f"TITLE:{data.get('TITLE')}\n")
                         lines.append(f"BDAY:{data.get('BDAY', '1900-01-01')}\n")
                         
-                        adr = data.get('ADR', ['ADR:;;;;;;;'])[0] if data.get('ADR') else 'ADR:;;;;;;;'
-                        lines.append(f"{adr}\n")
+                        # Write all ADR entries, preserving TYPE parameters
+                        adr_values_raw = [a for a in data.get('ADR', []) if isinstance(a, str) and ':' in a and a.upper().startswith('ADR')]
+                        # Filter out ADRs that accidentally include NOTE labels (from earlier runs)
+                        filtered_adr = []
+                        for adr in adr_values_raw:
+                            payload = adr.split(':', 1)[-1]
+                            low = payload.lower()
+                            if any(lbl in low for lbl in (
+                                'business street:', 'business city:', 'business postal code:', 'business country/region:', 'business country:'
+                            )):
+                                # skip malformed ADR that still contains labels; a clean ADR should also exist
+                                continue
+                            filtered_adr.append(adr)
+                        adr_values_raw = filtered_adr
+                        if adr_values_raw:
+                            # Prefer ADR variants with fewer mojibake markers for the same payload
+                            def mojibake_score(s: str) -> int:
+                                return sum(s.count(m) for m in ('Ã', 'Â', 'â', 'ï¿½', '\ufffd'))
+                            best_by_fixed_payload: Dict[str, Tuple[int, int, str]] = {}
+                            def adr_priority(adr_line: str) -> int:
+                                head = adr_line.split(':', 1)[0].upper()
+                                if 'TYPE=WORK' in head:
+                                    return 0
+                                if 'TYPE=HOME' in head:
+                                    return 1
+                                return 2
+                            for idx, adr in enumerate(adr_values_raw):
+                                payload = adr.split(':', 1)[-1].strip()
+                                fixed_payload = self.parser._fix_text(payload).lower()
+                                score = mojibake_score(payload)
+                                entry = (adr_priority(adr), idx, adr)
+                                if fixed_payload not in best_by_fixed_payload:
+                                    best_by_fixed_payload[fixed_payload] = (score, ) + entry
+                                else:
+                                    prev = best_by_fixed_payload[fixed_payload]
+                                    # pick lower mojibake score; if tie, keep earlier priority order
+                                    if score < prev[0] or (score == prev[0] and (entry[0], entry[1]) < (prev[1], prev[2])):
+                                        best_by_fixed_payload[fixed_payload] = (score, ) + entry
+                            adr_entries: List[Tuple[int, int, str]] = []
+                            for _score, prio, idx, line in best_by_fixed_payload.values():
+                                adr_entries.append((prio, idx, line))
+                            adr_entries.sort(key=lambda x: (x[0], x[1]))
+                            for _, __, adr_line in adr_entries:
+                                lines.append(f"{adr_line}\n")
+                        else:
+                            lines.append("ADR:;;;;;;;\n")
                         
                         # Preserve original TEL entries (including TYPE params) and de-duplicate by number
                         tel_values_raw = [tel for tel in data.get('TEL', []) if ':' in tel]
@@ -864,6 +1340,17 @@ class VCFProcessor:
                             if 'FAX' in before_colon:
                                 return 3
                             return 4
+                        def infer_tel_params(number: str) -> str:
+                            # Infer German mobile vs. generic voice based on prefix
+                            normalized = re.sub(r'[^\d+]', '', number)
+                            # Handle national format starting with 0 or international +49
+                            is_mobile = False
+                            if normalized.startswith('+49') and len(normalized) > 3:
+                                is_mobile = normalized[3:4] == '1' and normalized[4:5] in ('5', '6', '7')
+                            elif normalized.startswith('0') and len(normalized) > 1:
+                                is_mobile = normalized[1:2] == '1' and normalized[2:3] in ('5', '6', '7')
+                            return ';TYPE=CELL;TYPE=VOICE' if is_mobile else ';TYPE=VOICE'
+
                         for idx, tel in enumerate(tel_values_raw):
                             num = tel.split(':', 1)[-1].strip()
                             if not num:
@@ -873,6 +1360,11 @@ class VCFProcessor:
                                 continue
                             seen_nums.add(normalized)
                             line = tel if tel.upper().startswith('TEL') else f"TEL:{num}"
+                            # If TEL has no TYPE parameters, add inferred params (at least TYPE=VOICE)
+                            before_colon = line.split(':', 1)[0]
+                            if before_colon.upper() == 'TEL':
+                                params = infer_tel_params(num)
+                                line = f"TEL{params}:{num}"
                             tel_entries.append((tel_priority(line), idx, line))
                         # Sort by priority, keeping stable order within same priority, then write all
                         tel_entries.sort(key=lambda x: (x[0], x[1]))
@@ -955,6 +1447,11 @@ class VCFMerger:
         self.config = VCFConfig(config_file)
         self.logger = setup_logging(self.config.get('log_level', 'INFO'))
         self.processor = VCFProcessor(self.config, self.logger)
+        self._stats = {
+            'total_contacts': 0,
+            'contacts_processed': 0,
+            'processing_time': 0.0,
+        }
     
     def create_backup(self, file_path: str) -> None:
         """Create backup of existing file."""
@@ -975,6 +1472,7 @@ class VCFMerger:
     def update_vcf_with_vcf(self, remove_duplicates_flag: bool = True) -> str:
         """Update VCF file with another VCF file."""
         try:
+            start_time = time.perf_counter()
             # Get file paths
             source_file = self.config.get('input_files', {}).get('source')
             update_file = self.config.get('input_files', {}).get('update')
@@ -1030,8 +1528,54 @@ class VCFMerger:
                 base_name = os.path.splitext(output_file)[0]
                 output_file = f"{base_name}_no_duplicates.vcf"
             
+            # Optional: audit after merge
+            if self.config.get('audit_after_merge', True):
+                try:
+                    audit_csv = os.path.splitext(output_file)[0] + "_merge_audit.csv"
+                    audit_json = os.path.splitext(output_file)[0] + "_merge_audit.json"
+                    self._write_merge_audit(merged_contacts, source_contacts, update_contacts if update_file else {}, audit_csv, audit_json)
+                    self.logger.info(f"Merge audit written: {audit_csv}, {audit_json}")
+                except Exception as e:
+                    self.logger.error(f"Failed to write merge audit: {e}")
+
             # Write merged contacts
             self.processor.write_vcf(merged_contacts, output_file)
+            # Optional validation after write
+            if self.config.get('validate_after_write', False):
+                report = self.processor.validate_vcf(output_file)
+                report_file = os.path.splitext(output_file)[0] + "_validation.txt"
+                try:
+                    with open(report_file, 'w', encoding='utf-8') as rf:
+                        rf.write(f"Validation report for {report['file']}\n")
+                        rf.write("Issues by category:\n")
+                        for k, v in report['counts'].items():
+                            rf.write(f"- {k}: {v}\n")
+                        rf.write("\nContacts with issues:\n")
+                        for name in report['contacts_with_issues']:
+                            rf.write(f"- {name}\n")
+                        rf.write("\nMissing core fields (contacts count):\n")
+                        rf.write(f"- missing_tel: {report['counts']['missing_tel']}\n")
+                        rf.write(f"- missing_email: {report['counts']['missing_email']}\n")
+                        rf.write(f"- missing_adr: {report['counts']['missing_adr']}\n")
+                        rf.write("\nExamples (up to 10 per category):\n")
+                        for cat, items in report['examples'].items():
+                            rf.write(f"\n[{cat}]\n")
+                            for name, line in items:
+                                rf.write(f"{name}: {line}\n")
+                    self.logger.info(f"Validation report written: {report_file}")
+                    # Also log a concise on-screen summary
+                    self.logger.info("Validation summary (counts):")
+                    for k, v in report['counts'].items():
+                        self.logger.info(f"- {k}: {v}")
+                    self.logger.info(f"Contacts with issues: {len(report['contacts_with_issues'])}")
+                except Exception as e:
+                    self.logger.error(f"Could not write validation report: {e}")
+            # Update stats
+            elapsed = time.perf_counter() - start_time
+            self._stats['total_contacts'] = len(merged_contacts)
+            # Define processed as total contacts written
+            self._stats['contacts_processed'] = len(merged_contacts)
+            self._stats['processing_time'] = elapsed
             
             self.logger.info("Merging process completed successfully")
             return output_file
@@ -1084,13 +1628,57 @@ class VCFMerger:
         """
         Returns statistics about the last processing run.
         """
-        # This is a placeholder. In a real scenario, you'd store stats in a class attribute.
-        # For now, we'll return dummy values.
-        return {
-            'total_contacts': 0,
-            'contacts_processed': 0,
-            'processing_time': 0.0
-        }
+        return dict(self._stats)
+
+    def _write_merge_audit(self, merged: Dict[str, Any], source: Dict[str, Any], update: Dict[str, Any], csv_path: str, json_path: str) -> None:
+        """Write a simple merge audit (CSV + JSON) showing diffs and final counts."""
+        import csv
+        def is_mojibake(s: Any) -> bool:
+            return isinstance(s, str) and any(m in s for m in ('Ã', 'Â', 'â', 'ï¿½', '\ufffd'))
+
+        fields = ['FN','N','ORG','BDAY','ADR','TEL','EMAIL']
+        rows = []
+        details = {}
+        names = sorted(set(list(merged.keys()) + list(source.keys()) + list(update.keys())))
+        for name in names:
+            m = merged.get(name, {})
+            s = source.get(name, {})
+            u = update.get(name, {})
+            row = {
+                'FN': name,
+                'has_source': name in source,
+                'has_update': name in update,
+                'tel_source_count': len(s.get('TEL', [])) if isinstance(s.get('TEL'), list) else (1 if s.get('TEL') else 0),
+                'tel_update_count': len(u.get('TEL', [])) if isinstance(u.get('TEL'), list) else (1 if u.get('TEL') else 0),
+                'tel_final_count': len(m.get('TEL', [])) if isinstance(m.get('TEL'), list) else (1 if m.get('TEL') else 0),
+                'email_source_count': len(s.get('EMAIL', [])) if isinstance(s.get('EMAIL'), list) else (1 if s.get('EMAIL') else 0),
+                'email_update_count': len(u.get('EMAIL', [])) if isinstance(u.get('EMAIL'), list) else (1 if u.get('EMAIL') else 0),
+                'email_final_count': len(m.get('EMAIL', [])) if isinstance(m.get('EMAIL'), list) else (1 if m.get('EMAIL') else 0),
+                'adr_source_count': len(s.get('ADR', [])) if isinstance(s.get('ADR'), list) else (1 if s.get('ADR') else 0),
+                'adr_update_count': len(u.get('ADR', [])) if isinstance(u.get('ADR'), list) else (1 if u.get('ADR') else 0),
+                'adr_final_count': len(m.get('ADR', [])) if isinstance(m.get('ADR'), list) else (1 if m.get('ADR') else 0),
+                'bday_source': s.get('BDAY',''),
+                'bday_update': u.get('BDAY',''),
+                'bday_final': m.get('BDAY',''),
+                'mojibake_source': any(is_mojibake(s.get(k,'')) for k in ['FN','N','ORG','BDAY']),
+                'mojibake_update': any(is_mojibake(u.get(k,'')) for k in ['FN','N','ORG','BDAY']),
+                'mojibake_final': any(is_mojibake(m.get(k,'')) for k in ['FN','N','ORG','BDAY']),
+            }
+            rows.append(row)
+            details[name] = {
+                'source': s,
+                'update': u,
+                'final': m,
+            }
+        # CSV
+        with open(csv_path, 'w', newline='', encoding='utf-8') as cf:
+            writer = csv.DictWriter(cf, fieldnames=list(rows[0].keys()) if rows else ['FN'])
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+        # JSON
+        with open(json_path, 'w', encoding='utf-8') as jf:
+            json.dump(details, jf, ensure_ascii=False, indent=2)
 
 def main() -> int:
     """Enhanced main function with better error handling and user feedback."""
