@@ -61,6 +61,14 @@ Usage
   - Write the combined VCF to `output_file`
   - If `split_output` is true, also write one `.vcf` per contact under `split_output_dir`
 
+Quick Switches
+- Split output on/off: set `split_output` to `true` (one `.vcf` per contact) or `false` (single file only).
+- Validation report: set `validate_after_write` to `true` to generate `…_validation.txt` after writing.
+- What counts as an “issue”: control via `validation_flags` in `vcf_config.json`.
+  - By default this repo flags only contacts that have neither phone nor email. You can widen it by setting flags to `true` (e.g., `include_mojibake`).
+- Merge audit: set `audit_after_merge` to `true` to output `…_merge_audit.csv/.json` that summarizes what changed per contact.
+- Trace specific contacts: add exact display names to `trace_contacts` to log parsed/merged TEL/ADR/EMAIL for just those entries.
+
 Outlook/iCloud Tips
 - Outlook often imports only the first contact from a multi-card VCF. Use `split_output: true` and drag all generated `.vcf` files into Outlook’s Contacts folder.
 - TYPE parameters (`WORK`, `HOME`, `CELL`) are preserved for phone numbers so Outlook/iCloud put them in the right fields.
